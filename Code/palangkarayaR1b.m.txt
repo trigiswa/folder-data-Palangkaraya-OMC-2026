@@ -1,0 +1,294 @@
+%% FINAL EXPLORATORY ANALYSIS: PALANGKARAYA WEATHER MODIFICATION
+% Evaluasi hubungan kondisi atmosfer, aktivitas penerbangan, material
+% penyemaian, dan curah hujan harian di Palangka Raya.
+%
+% INPUT:
+%   1. era5_data.csv
+%   2. proxy_flight_logs.xlsx, sheet "Chronological Ledger"
+%
+% KATEGORI PERLAKUAN DITENTUKAN DARI MASSA MATERIAL:
+%   - No OMC (Baseline Reference Group)
+%   - NaCl only (Low-to-Medium Intensity)
+%   - NaCl + Dry Ice (High Intensity Joint Operation)
+%
+% CATATAN METODOLOGI:
+%   - Model ini bersifat observasional/eksploratif, bukan bukti kausal.
+%   - 'sorties' dihapus dari regresi efek utama karena collinearity struktural 
+%     dengan kelompok Treatment (No OMC = 0 sorties, NaCl = 1.5, Combo = 3.2).
+%   - Mean_T850m1000m adalah rata-rata selisih T850-T1000 harian.
+%   - CI pada grafik adalah confidence interval untuk mean response.
+%
+% Kompatibilitas: MATLAB R2021 atau lebih baru; Statistics and Machine
+% Learning Toolbox diperlukan untuk fitlm, predict, dan diagnostik model.
+
+clear; clc; close all;
+
+%% 1. INPUT FILES
+era5File = 'era5_data.csv';
+logFile  = 'proxy_flight_logs.xlsx';
+logSheet = 'Chronological Ledger';
+
+% Pilih file melalui dialog jika file tidak berada di Current Folder.
+if ~isfile(era5File)
+    [f,p] = uigetfile('*.csv','Pilih file ERA5 CSV');
+    if isequal(f,0), error('File ERA5 tidak dipilih.'); end
+    era5File = fullfile(p,f);
+end
+
+if ~isfile(logFile)
+    [f,p] = uigetfile({'*.xlsx;*.xls','Excel files'}, 'Pilih file proxy flight logs');
+    if isequal(f,0), error('File proxy flight logs tidak dipilih.'); end
+    logFile = fullfile(p,f);
+end
+
+fprintf('\nMembaca dataset...\n');
+E = readtable(era5File,'PreserveVariableNames',true);
+L = readtable(logFile,'Sheet',logSheet,'PreserveVariableNames',true);
+
+%% 2. VALIDATE REQUIRED COLUMNS
+requiredERA = {'DateTime','CAPE_Jkg','Temp_1000hPa','Temp_850hPa','Total_Rain_mm'};
+requiredLOG = {'date','sorties','NaCl (kg)','Dry Ice (kg)','Dry_Ice_Used'};
+
+missingERA = requiredERA(~ismember(requiredERA,E.Properties.VariableNames));
+missingLOG = requiredLOG(~ismember(requiredLOG,L.Properties.VariableNames));
+
+if ~isempty(missingERA), error('Kolom ERA5 tidak ditemukan: %s',strjoin(missingERA,', ')); end
+if ~isempty(missingLOG), error('Kolom flight logs tidak ditemukan: %s',strjoin(missingLOG,', ')); end
+
+%% 3. CONVERT DATE/TIME
+E.DateTime = convertToDatetime(E.DateTime, 'yyyy-MM-dd HH:mm:ss');
+L.date = convertToDatetime(L.date,'yyyy-MM-dd');
+
+E.Date = dateshift(E.DateTime,'start','day');
+L.date = dateshift(L.date,'start','day');
+
+%% 4. CHECK NUMERIC VARIABLES AND REMOVE INVALID ROWS
+eraNumeric = {'CAPE_Jkg','Temp_1000hPa','Temp_850hPa','Total_Rain_mm'};
+for k = 1:numel(eraNumeric)
+    if ~isnumeric(E.(eraNumeric{k})), error('Kolom ERA5 %s harus bertipe numerik.',eraNumeric{k}); end
+end
+
+logNumeric = {'sorties','NaCl (kg)','Dry Ice (kg)','Dry_Ice_Used'};
+for k = 1:numel(logNumeric)
+    if ~isnumeric(L.(logNumeric{k})), error('Kolom flight logs %s harus bertipe numerik.',logNumeric{k}); end
+end
+
+validE = ~isnat(E.DateTime) & isfinite(E.CAPE_Jkg) & isfinite(E.Temp_1000hPa) & isfinite(E.Temp_850hPa) & isfinite(E.Total_Rain_mm);
+validL = ~isnat(L.date) & isfinite(L.sorties) & isfinite(L.("NaCl (kg)")) & isfinite(L.("Dry Ice (kg)")) & isfinite(L.Dry_Ice_Used);
+
+E = E(validE,:);
+L = L(validL,:);
+
+%% 5. CHECK DUPLICATES
+if numel(unique(E.DateTime)) ~= height(E), error('Ditemukan timestamp ERA5 duplikat.'); end
+if numel(unique(L.date)) ~= height(L), error('Ditemukan tanggal duplikat pada flight logs.'); end
+
+%% 6. AGGREGATE HOURLY ERA5 DATA INTO DAILY METRICS
+E.Temp850_minus_Temp1000 = E.Temp_850hPa - E.Temp_1000hPa;
+uniqueDays = unique(E.Date);
+nDays = numel(uniqueDays);
+
+outDate = NaT(nDays,1); outCAPE = NaN(nDays,1);
+outTempGradientMean = NaN(nDays,1); outRain = NaN(nDays,1); outNHours = zeros(nDays,1);
+
+for k = 1:nDays
+    idx = E.Date == uniqueDays(k);
+    D = E(idx,:);
+    outDate(k) = uniqueDays(k);
+    outCAPE(k) = max(D.CAPE_Jkg,[],'omitnan');
+    outTempGradientMean(k) = mean(D.Temp850_minus_Temp1000,'omitnan');
+    outRain(k) = sum(D.Total_Rain_mm,'omitnan');
+    outNHours(k) = height(D);
+end
+
+DailyERA5 = table(outDate,outCAPE,outTempGradientMean,outRain,outNHours,...
+    'VariableNames',{'date','Max_CAPE','Mean_T850m1000m','Total_Rain_mm','N_Hours'});
+
+fprintf('\n===== PEMERIKSAAN KELENGKAPAN ERA5 HARIAN =====\n');
+fprintf('Jumlah hari ERA5: %d\n',height(DailyERA5));
+fprintf('Hari dengan 24 jam lengkap: %d dari %d\n',sum(DailyERA5.N_Hours==24),height(DailyERA5));
+if any(DailyERA5.N_Hours ~= 24)
+    warning('Terdapat hari dengan jumlah data bukan 24 jam. Periksa akumulasi hujan.');
+end
+
+%% 7. CLASSIFY TREATMENT FROM ACTUAL MATERIAL MASS
+nacl = L.("NaCl (kg)");
+dryice = L.("Dry Ice (kg)");
+if any(nacl < 0) || any(dryice < 0), error('Ditemukan massa material negatif.'); end
+
+treatment = strings(height(L),1);
+treatment(nacl == 0 & dryice == 0) = "No OMC";
+treatment(nacl > 0 & dryice == 0)  = "NaCl only";
+treatment(nacl > 0 & dryice > 0)   = "NaCl + Dry Ice";
+treatment(nacl == 0 & dryice > 0)  = "Dry Ice only";
+
+L.Treatment = categorical(treatment);
+
+%% 8. TREATMENT FREQUENCY TABLE
+fprintf('\n===== DISTRIBUSI KATEGORI PERLAKUAN =====\n');
+treatLevelsLog = {'No OMC', 'NaCl only', 'NaCl + Dry Ice', 'Dry Ice only'}; % Dynamically adjusted safely
+TreatmentName = strings(4,1); NumberOfDays = zeros(4,1);
+for g = 1:4
+    TreatmentName(g) = string(treatLevelsLog{g});
+    NumberOfDays(g) = sum(L.Treatment == treatLevelsLog{g});
+end
+disp(table(TreatmentName,NumberOfDays,'VariableNames',{'Treatment','NumberOfDays'}));
+
+%% 9. MERGE ERA5 AND FLIGHT LOGS
+AnalysisDataset = innerjoin(DailyERA5,L,'Keys','date');
+if isempty(AnalysisDataset), error('Tidak ada tanggal yang cocok antara dataset.'); end
+AnalysisDataset = sortrows(AnalysisDataset,'date');
+
+fprintf('\n===== DATASET HASIL PENGGABUNGAN =====\n');
+fprintf('Jumlah tanggal hasil penggabungan: %d\n',height(AnalysisDataset));
+
+%% 10. SET REFERENCE CATEGORY: NO OMC (Monotonic Ordinal Sequence)
+%% 10. SET REFERENCE CATEGORY: NO OMC (Monotonic Ordinal Sequence)
+% Mendapatkan list kategori unik yang benar-benar ada di dalam dataset gabungan
+presentCategories = unique(categories(AnalysisDataset.Treatment));
+
+% Urutan prioritas dasar yang kita inginkan
+masterOrder = {'No OMC', 'NaCl only', 'NaCl + Dry Ice', 'Dry Ice only'};
+
+% Menyaring masterOrder hanya untuk kategori yang benar-benar ada di data
+validOrder = masterOrder(ismember(masterOrder, presentCategories));
+
+% Melakukan reordercats secara aman tanpa memicu error akibat kategori kosong
+AnalysisDataset.Treatment = reordercats(AnalysisDataset.Treatment, validOrder);
+
+%% 11. DESCRIPTIVE STATISTICS BY TREATMENT
+fprintf('\n===== STATISTIK DESKRIPTIF BERDASARKAN PERLAKUAN =====\n');
+treatLevels = categories(AnalysisDataset.Treatment);
+nGroups = numel(treatLevels);
+
+TreatmentName = strings(nGroups,1); N = zeros(nGroups,1);
+MeanRain = NaN(nGroups,1); MedianRain = NaN(nGroups,1); StdRain = NaN(nGroups,1);
+MeanCAPE = NaN(nGroups,1); MeanSorties = NaN(nGroups,1);
+
+for g = 1:nGroups
+    idx = AnalysisDataset.Treatment == treatLevels{g};
+    TreatmentName(g) = string(treatLevels{g});
+    N(g) = sum(idx);
+    MeanRain(g) = mean(AnalysisDataset.Total_Rain_mm(idx),'omitnan');
+    MedianRain(g) = median(AnalysisDataset.Total_Rain_mm(idx),'omitnan');
+    StdRain(g) = std(AnalysisDataset.Total_Rain_mm(idx),'omitnan');
+    MeanCAPE(g) = mean(AnalysisDataset.Max_CAPE(idx),'omitnan');
+    MeanSorties(g) = mean(AnalysisDataset.sorties(idx),'omitnan');
+end
+
+SummaryTable = table(TreatmentName,N,MeanRain,MedianRain,StdRain,MeanCAPE,MeanSorties,...
+    'VariableNames',{'Treatment','NumberOfDays','MeanRainfall_mm','MedianRainfall_mm','StdRainfall_mm','MeanCAPE_Jkg','MeanSorties'});
+disp(SummaryTable);
+
+%% 12. PREPARE DATA FOR REGRESSION
+modelVars = {'Total_Rain_mm','Max_CAPE','Mean_T850m1000m','sorties','Treatment'};
+Tmodel = AnalysisDataset(:,modelVars);
+validModel = isfinite(Tmodel.Total_Rain_mm) & isfinite(Tmodel.Max_CAPE) & isfinite(Tmodel.Mean_T850m1000m) & ~isundefined(Tmodel.Treatment);
+Tmodel = Tmodel(validModel,:);
+
+%% 13. MULTIPLE LINEAR REGRESSION (Optimized Formula)
+%fprintf('\n===== HASIL REGRESI MULTIPLE LINEAR REGRESSION =====\n');
+%mdl = fitlm(Tmodel, 'Total_Rain_mm ~ Max_CAPE + Mean_T850m1000m + Treatment');
+%disp(mdl);
+%
+%fprintf('R-squared          : %.4f\n',mdl.Rsquared.Ordinary);
+%fprintf('Adjusted R-squared : %.4f\n',mdl.Rsquared.Adjusted);
+
+%% 13. MULTIPLE LINEAR REGRESSION WITH INTERACTION TERM
+% Menggunakan operator '*' untuk menyertakan efek utama sekaligus efek interaksi:
+% Total_Rain_mm ~ Max_CAPE + Mean_T850m1000m + Treatment + (Max_CAPE * Treatment)
+fprintf('\n===== HASIL REGRESI DENGAN VARIABEL INTERAKSI =====\n');
+mdl = fitlm(Tmodel, 'Total_Rain_mm ~ Mean_T850m1000m + Max_CAPE * Treatment');
+disp(mdl);
+
+fprintf('R-squared          : %.4f\n',mdl.Rsquared.Ordinary);
+fprintf('Adjusted R-squared : %.4f\n',mdl.Rsquared.Adjusted);
+
+
+%% 14. COEFFICIENT TABLE WITH 95% CONFIDENCE INTERVAL
+coefCI95 = coefCI(mdl,0.05);
+CoefficientTable = table(string(mdl.CoefficientNames(:)), mdl.Coefficients.Estimate, mdl.Coefficients.SE, mdl.Coefficients.pValue, coefCI95(:,1), coefCI95(:,2),...
+    'VariableNames',{'Predictor','Estimate','SE','pValue','Lower95CI','Upper95CI'});
+fprintf('\n===== TABEL KOEFISIEN REGRESI =====\n');
+disp(CoefficientTable);
+
+%% 15. PLOT OBSERVATIONS, MODEL LINES, AND 95% CI (Clean Alignment)
+%% 15. PLOT INTERACTION EFFECTS WITH 95% CONFIDENCE INTERVALS
+%figure('Color','w','Position',[100 100 1150 720]);
+figure('Color','w','Position',[100 100 1150 550]);
+hold on; box on; grid on;
+set(gca,'GridLineStyle',':','GridAlpha',0.35);
+
+% Definisikan warna standar untuk setiap kelompok perlakuan
+groupColors = [0.4 0.4 0.4;  % Abu-abu untuk No OMC (Kontrol)
+               0.2 0.6 0.2;  % Hijau untuk NaCl only
+               0.0 0.4 0.8]; % Biru untuk Joint Combo (NaCl + Dry Ice)
+
+% Buat grid data CAPE untuk prediksi smooth line
+capeGrid = linspace(min(Tmodel.Max_CAPE), max(Tmodel.Max_CAPE), 200)';
+meanGradient = mean(Tmodel.Mean_T850m1000m,'omitnan');
+
+% Ambil list kategori yang aktif (abaikan Dry Ice Only karena 0 hari)
+activeLevels = {'No OMC', 'NaCl only', 'NaCl + Dry Ice'};
+nActive = numel(activeLevels);
+
+for g = 1:nActive
+    thisName = activeLevels{g};
+    idx = Tmodel.Treatment == thisName;
+    
+    % 1. Plot data sebaran asli (Scatter Points)
+    scatter(Tmodel.Max_CAPE(idx), Tmodel.Total_Rain_mm(idx), 55,...
+        'MarkerFaceColor',groupColors(g,:),'MarkerEdgeColor',[0.2 0.2 0.2],...
+        'MarkerFaceAlpha',0.65,'DisplayName',['Observed: ' thisName]);
+
+    % 2. Buat matriks prediktor untuk model interaksi
+    predTreatment = categorical(repmat({thisName}, numel(capeGrid), 1), categories(Tmodel.Treatment));
+    newT = table(repmat(meanGradient, numel(capeGrid), 1), capeGrid, predTreatment,...
+        'VariableNames',{'Mean_T850m1000m','Max_CAPE','Treatment'});
+    
+    % Hitung prediksi mean response beserta 95% Confidence Interval
+    [yPred, yCI] = predict(mdl, newT, 'Alpha', 0.05);
+
+    % 3. Plot Shading Confidence Interval (95% CI)
+    fill([capeGrid; flipud(capeGrid)], [yCI(:,1); flipud(yCI(:,2))], groupColors(g,:),...
+        'FaceAlpha',0.10, 'EdgeColor','none', 'HandleVisibility','off');
+
+    % 4. Plot Garis Tren Prediksi Model Interaksi
+    plot(capeGrid, yPred, 'Color', groupColors(g,:), 'LineWidth', 3,...
+        'DisplayName',['Model Fit: ' thisName]);
+end
+
+% Atur anotasi grafik
+xlabel('ERA5 Daily Maximum CAPE (J/kg)', 'FontSize', 11, 'FontWeight', 'bold');
+ylabel('Predicted Daily Accumulated Rainfall (mm)', 'FontSize', 11, 'FontWeight', 'bold');
+title({'Palangkaraya Weather Modification: Interaction Effect Analysis',...
+'Sinergi Operasi OMC Berdasarkan Tingkat Energi Konvektif Atmosfer (Max CAPE)'},...
+'FontSize', 13, 'FontWeight', 'bold');
+
+legend('Location', 'northwest', 'FontSize', 10);
+set(gca, 'FontSize', 11);
+hold off;
+
+% Simpan hasil grafik dengan resolusi tinggi (300 DPI)
+%print('Palangkaraya_OMC_Interaction_Plot', '-dtiff', '-r300');
+print('Palangkaraya_OMC_Interaction_Plot', '-dpng', '-r300');
+
+
+%% 16. MODEL DIAGNOSTICS
+figure('Color','w'); plotResiduals(mdl,'fitted'); title('Residuals versus Fitted Values');
+figure('Color','w'); plotDiagnostics(mdl,'cookd'); title('Cook''s Distance: Influential Observations');
+figure('Color','w'); plotResiduals(mdl,'probability'); title('Normal Probability Plot of Residuals');
+%% 17. EXPORT RESULTS
+writetable(AnalysisDataset, 'Palangkaraya_Integrated_Dataset.csv');
+writetable(SummaryTable, 'Palangkaraya_Descriptive_Statistics.csv');
+writetable(CoefficientTable, 'Palangkaraya_Regression_Coefficients.csv');
+fprintf('\n====================================================\nANALISIS SELESAI & FILE BERHASIL DIEKSPOR\n====================================================\n');
+%% LOCAL FUNCTION
+function dt = convertToDatetime(x,inputFormat)
+if isdatetime(x), dt = x;
+elseif iscell(x) || isstring(x) || ischar(x), dt = datetime(x,'InputFormat',inputFormat);
+elseif isnumeric(x), dt = datetime(x,'ConvertFrom','excel');
+else, error('Format tanggal tidak dikenali.');
+end
+dt = dt(:);
+end
